@@ -43,7 +43,7 @@ internal/pubsub    broker interfaces
 
 ## Development
 
-Requires Go 1.22+.
+Requires Go 1.27+.
 
 ```
 go test -race ./...
