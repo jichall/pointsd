@@ -40,10 +40,16 @@ func (h *Handler) Handle(ctx context.Context, msg pubsub.Message) {
 		return
 	}
 
-	if err := h.process(ctx, ev); err != nil {
-		h.log.Error("processing failed", "payment_id", ev.PaymentID, "type", ev.Type, "err", err)
+	switch err := h.process(ctx, ev); {
+	case err == nil:
+		msg.Ack()
+	case errors.Is(err, ErrUnknownPayment):
+		h.log.Warn("reversal for payment that earned no points", "payment_id", ev.PaymentID, "member_id", ev.MemberID, "event_id", ev.EventID)
+		msg.Ack()
+	default:
+		h.log.Error("processing failed, nacking", "payment_id", ev.PaymentID, "type", ev.Type, "attempt", msg.DeliveryAttempt(), "err", err)
+		msg.Nack()
 	}
-	msg.Ack()
 }
 
 func (h *Handler) process(ctx context.Context, ev events.Payment) error {
@@ -57,54 +63,17 @@ func (h *Handler) process(ctx context.Context, ev events.Payment) error {
 }
 
 func (h *Handler) award(ctx context.Context, ev events.Payment) error {
-	seen, err := h.store.HasEntry(ctx, ev.PaymentID, ledger.KindAward)
-	if err != nil {
-		return err
-	}
-	if seen {
-		return nil
-	}
-
-	month := Month(ev.OccurredAt)
-	used, err := h.store.AwardedInMonth(ctx, ev.MemberID, month)
-	if err != nil {
-		return err
-	}
-	points := h.policy.Points(ev.AmountCents)
-	if room := h.policy.MonthlyCap - used; points > room {
-		points = max(room, 0)
-	}
-
-	return h.store.Append(ctx, ledger.Entry{
-		MemberID:  ev.MemberID,
-		PaymentID: ev.PaymentID,
-		Kind:      ledger.KindAward,
-		Points:    points,
-		Month:     month,
-	})
+	_, _, err := h.store.Award(ctx, ev.MemberID, ev.PaymentID, Month(ev.OccurredAt), h.policy.Points(ev.AmountCents), h.policy.MonthlyCap)
+	return err
 }
 
 func (h *Handler) reverse(ctx context.Context, ev events.Payment) error {
-	awarded, err := h.store.HasEntry(ctx, ev.PaymentID, ledger.KindAward)
-	if err != nil {
-		return err
-	}
-	if !awarded {
+	removed, dup, err := h.store.Reverse(ctx, ev.MemberID, ev.PaymentID)
+	switch {
+	case errors.Is(err, ledger.ErrNoAward):
+		return ErrUnknownPayment
+	case err == nil && !dup && removed == 0:
 		return ErrUnknownPayment
 	}
-	done, err := h.store.HasEntry(ctx, ev.PaymentID, ledger.KindReversal)
-	if err != nil {
-		return err
-	}
-	if done {
-		return nil
-	}
-
-	return h.store.Append(ctx, ledger.Entry{
-		MemberID:  ev.MemberID,
-		PaymentID: ev.PaymentID,
-		Kind:      ledger.KindReversal,
-		Points:    -h.policy.Points(ev.AmountCents),
-		Month:     Month(ev.OccurredAt),
-	})
+	return err
 }
